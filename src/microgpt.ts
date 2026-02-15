@@ -1,323 +1,372 @@
-// Autograd Value node
-export class Value {
-    data: number; grad: number = 0; _children: Value[]; _local_grads: number[]
+import * as tf from "@tensorflow/tfjs";
+import '@tensorflow/tfjs-backend-webgpu';
+(async () => {
+    if (typeof navigator !== 'undefined' && navigator.gpu && await navigator.gpu.requestAdapter()) {
+        try { await tf.setBackend('webgpu'); tf.tidy(() => tf.tensor([1]).add(tf.tensor([1]))); }
+        catch { await tf.setBackend('webgl'); }
+    } else { await tf.setBackend('webgl'); }
+    console.log('backend:', tf.getBackend())
+})()
 
-    constructor(data: number, _children: Value[] = [], _local_grads: number[] = []) {
-        this.data = data
-        this._children = _children
-        this._local_grads = _local_grads
-    }
+// ── Types ──────────────────────────────────────────────────────────────
 
-    add(other: Value | number) {
-        const o = other instanceof Value ? other : new Value(other)
-        return new Value(this.data + o.data, [this, o], [1, 1])
-    }
-    sub(other: Value | number) {
-        const o = other instanceof Value ? other : new Value(other)
-        return new Value(this.data - o.data, [this, o], [1, -1])
-    }
-    mul(other: Value | number) {
-        const o = other instanceof Value ? other : new Value(other)
-        return new Value(this.data * o.data, [this, o], [o.data, this.data])
-    }
-    div(other: Value | number) {
-        const o = other instanceof Value ? other : new Value(other)
-        return this.mul(o.pow(-1))
-    }
-    exp() {
-        const out = Math.exp(this.data)
-        return new Value(out, [this], [out])
-    }
-    pow = (e: number) => new Value(this.data ** e, [this], [e * this.data ** (e - 1)])
-    log = () => new Value(Math.log(this.data), [this], [1 / this.data])
-    neg = () => this.mul(-1)
-    relu = () => new Value(this.data < 0 ? 0 : this.data, [this], [this.data > 0 ? 1 : 0])
+export type ModelOpts = { n_embd?: number; n_head?: number; n_layer?: number; block_size?: number; batch?: number };
 
-    backward() {
-        const topo: Value[] = []
-        const visited = new Set<Value>()
-        const build = (v: Value) => {
-            if (visited.has(v)) return
-            visited.add(v)
-            for (const c of v._children) build(c)
-            topo.push(v)
-        }
-        build(this)
-        this.grad = 1.0
-        for (let i = topo.length - 1; i >= 0; i--) {
-            const v = topo[i]
-            for (let j = 0; j < v._children.length; j++)
-                v._children[j].grad += v._local_grads[j] * v.grad
-        }
-    }
+export type HeadTrace = { scores: number[]; weights: number[]; out: number[]; };
+
+export type LayerTrace = { r1: number[]; norm1: number[]; q: number[]; k: number[]; v: number[]; cached_keys: number[][]; cached_values: number[][]; heads: HeadTrace[]; concat: number[]; wo: number[]; res1: number[]; r2: number[]; norm2: number[]; fc1: number[]; relu: number[]; fc2: number[]; res2: number[]; };
+
+export type Trace = { token_id: number; pos_id: number; embedding: number[]; norm0: number[]; layers: LayerTrace[]; logits: number[]; probs: number[]; };
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/** Xavier-ish init */
+const initWeight = (shape: number[], std = 0.08): tf.Variable => tf.variable(tf.randomNormal(shape, 0, std));
+
+/** x @ W^T  — works on [B, T, C] × [out, C] → [B, T, out] */
+const linear = (x: tf.Tensor3D, w: tf.Variable): tf.Tensor3D => {
+    const [B, T, C] = x.shape;
+    const flat = x.reshape([B * T, C]);
+    const out = tf.matMul(flat, w, false, true);
+    return out.reshape([B, T, -1]) as tf.Tensor3D;
 }
 
-// Helpers
-const sum = (arr: Value[]) => arr.reduce((a, b) => a.add(b))
-const zip = <A, B>(a: A[], b: B[]) => a.map((ai, i) => [ai, b[i]] as [A, B])
+/** RMS-norm (no learnable gain) */
+const rmsnorm = (x: tf.Tensor, eps = 1e-5): tf.Tensor => tf.tidy(() => {
+    const ms = tf.mean(tf.square(x), -1, true);
+    return tf.div(x, tf.sqrt(tf.add(ms, eps)));
+});
 
-const linear = (x: Value[], w: Value[][]) => w.map(wo => sum(wo.map((wi, i) => wi.mul(x[i]))))
+/** Causal mask: 0 for allowed positions, -1e10 for masked ones. Shape [T, T]. */
+const causalMask = (T: number): tf.Tensor2D => tf.tidy(() => {
+    const buf = tf.buffer([T, T], "float32");
+    for (let i = 0; i < T; i++)
+        for (let j = i + 1; j < T; j++) buf.set(-1e10, i, j);
+    return buf.toTensor() as tf.Tensor2D;
+});
 
-function softmax(logits: Value[]) {
-    const max_val = Math.max(...logits.map(v => v.data))
-    const exps = logits.map(v => v.sub(max_val).exp())
-    const total = sum(exps)
-    return exps.map(e => e.div(total))
+// ── Tokenizer ──────────────────────────────────────────────────────────
+
+class CharTokenizer {
+    readonly chars: string[];
+    readonly stoi: Record<string, number> = {};
+    readonly itos: Record<number, string> = {};
+    readonly bos: number;
+
+    constructor(docs: string[]) {
+        this.chars = [...new Set(docs.join(""))].sort();
+        this.chars.forEach((c, i) => {
+            this.stoi[c] = i;
+            this.itos[i] = c;
+        });
+        this.bos = this.chars.length; // last id = BOS/EOS
+    }
+
+    get vocabSize() { return this.chars.length + 1; }
+    encode = (doc: string): number[] => [this.bos, ...doc.split("").map((c) => this.stoi[c]), this.bos];
 }
 
-function rmsnorm(x: Value[]) {
-    const ms = sum(x.map(xi => xi.mul(xi))).mul(1 / x.length)
-    const s = ms.add(1e-5).pow(-0.5)
-    return x.map(xi => xi.mul(s))
+// ── Layer weights ──────────────────────────────────────────────────────
+
+interface LayerWeights {
+    attn_wq: tf.Variable;
+    attn_wk: tf.Variable;
+    attn_wv: tf.Variable;
+    attn_wo: tf.Variable;
+    mlp_fc1: tf.Variable;
+    mlp_fc2: tf.Variable;
 }
 
-const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random())
-
-type StateDict = Record<string, Value[][]>
+// ── Model ──────────────────────────────────────────────────────────────
 
 export class MicroGPT {
-    n_embd = 16
-    n_head = 4
-    n_layer = 1
-    block_size = 16
-    head_dim = 4
-    scale: number
-    vocab_size: number
-    state_dict: StateDict = {}
-    params: Value[] = []
-    m_buf: Float64Array
-    v_buf: Float64Array
-    step_count = 0
+    // config
+    n_embd: number; n_head: number; n_layer: number; block_size: number; head_dim: number; scale: number; vocab_size: number;
+    // tokenizer state (public so App.tsx can read them)
+    docs: string[]; uchars: string[]; stoi: Record<string, number>; itos: Record<number, string>; bos: number;
+    // weights
+    wte: tf.Variable; wpe: tf.Variable; lm_head: tf.Variable; layers: LayerWeights[];
+    // training
+    optimizer: tf.AdamOptimizer; posIdx: tf.Tensor1D; maskCache = new Map<number, tf.Tensor2D>(); tokenizedDocs: number[][] = [];
+    step_count = 0;
 
-    docs: string[] = []
-    uchars: string[] = []
-    stoi: Record<string, number> = {}
-    itos: Record<number, string> = {}
-    bos = 0
+    // ── Factory ────────────────────────────────────────────────────────
 
-    static fromDocs(docs: string[]) {
-        const uchars = [...new Set(docs.join(''))].sort()
-        const m = new MicroGPT(uchars.length + 1)
-        m.docs = docs
-        m.uchars = uchars
-        uchars.forEach((c, i) => { m.stoi[c] = i; m.itos[i] = c })
-        m.bos = uchars.length
-        return m
+    static fromDocs(docs: string[], opts?: ModelOpts): MicroGPT {
+        const tok = new CharTokenizer(docs);
+        const m = new MicroGPT(tok.vocabSize, opts);
+        m.docs = docs;
+        m.uchars = tok.chars;
+        m.stoi = tok.stoi;
+        m.itos = tok.itos;
+        m.bos = tok.bos;
+        m.tokenizedDocs = docs.map((d) => m.tokenize(d));
+        return m;
     }
 
-    tokenize = (doc: string) => [this.bos, ...doc.split('').map(c => this.stoi[c]), this.bos]
+    // ── Constructor ────────────────────────────────────────────────────
 
-    trainOnDoc(doc?: string) {
-        doc ??= this.docs[Math.floor(Math.random() * this.docs.length)]
-        return this.trainStep(this.tokenize(doc))
+    constructor(vocabSize: number, opts?: ModelOpts) {
+        this.n_embd = opts?.n_embd ?? 16;
+        this.n_head = opts?.n_head ?? 4;
+        this.n_layer = opts?.n_layer ?? 1;
+        this.block_size = opts?.block_size ?? 16;
+        this.head_dim = Math.floor(this.n_embd / this.n_head);
+        this.scale = 1 / Math.sqrt(this.head_dim);
+        this.vocab_size = vocabSize;
+
+        this.docs = [];
+        this.uchars = [];
+        this.stoi = {};
+        this.itos = {};
+        this.bos = 0;
+
+        // embeddings
+        this.wte = initWeight([vocabSize, this.n_embd]);
+        this.wpe = initWeight([this.block_size, this.n_embd]);
+        this.lm_head = initWeight([vocabSize, this.n_embd]);
+
+        // transformer layers
+        const E = this.n_embd;
+        this.layers = Array.from({ length: this.n_layer }, () => ({
+            attn_wq: initWeight([E, E]), attn_wk: initWeight([E, E]), attn_wv: initWeight([E, E]), attn_wo: initWeight([E, E]),
+            mlp_fc1: initWeight([4 * E, E]), mlp_fc2: initWeight([E, 4 * E]),
+        }));
+
+        this.optimizer = tf.train.adam(0.01, 0.85, 0.99, 1e-8);
+        this.posIdx = tf.range(0, this.block_size, 1, "int32") as tf.Tensor1D;
     }
 
-    constructor(vocab_size: number) {
-        this.vocab_size = vocab_size
-        this.head_dim = Math.floor(this.n_embd / this.n_head)
-        this.scale = 1 / this.head_dim ** 0.5
+    // ── Accessors ──────────────────────────────────────────────────────
 
-        const matrix = (nout: number, nin: number, std = 0.08) =>
-            Array.from({ length: nout }, () =>
-                Array.from({ length: nin }, () => {
-                    const p = new Value(gauss() * std)
-                    this.params.push(p)
-                    return p
-                }))
+    get num_params(): number {
+        let sum = this.wte.size + this.wpe.size + this.lm_head.size;
+        this.layers.forEach(L => sum += L.attn_wq.size + L.attn_wk.size + L.attn_wv.size + L.attn_wo.size + L.mlp_fc1.size + L.mlp_fc2.size);
+        return sum;
+    }
 
-        this.state_dict['wte'] = matrix(vocab_size, this.n_embd)
-        this.state_dict['wpe'] = matrix(this.block_size, this.n_embd)
-        this.state_dict['lm_head'] = matrix(vocab_size, this.n_embd)
+    get state_dict(): Record<string, tf.Variable> {
+        const sd: Record<string, tf.Variable> = { wte: this.wte, wpe: this.wpe, lm_head: this.lm_head };
+        this.layers.forEach((L, i) => {
+            sd[`layer${i}.attn_wq`] = L.attn_wq;
+            sd[`layer${i}.attn_wk`] = L.attn_wk;
+            sd[`layer${i}.attn_wv`] = L.attn_wv;
+            sd[`layer${i}.attn_wo`] = L.attn_wo;
+            sd[`layer${i}.mlp_fc1`] = L.mlp_fc1;
+            sd[`layer${i}.mlp_fc2`] = L.mlp_fc2;
+        });
+        return sd;
+    }
 
-        for (let i = 0; i < this.n_layer; i++) {
-            this.state_dict[`layer${i}.attn_wq`] = matrix(this.n_embd, this.n_embd)
-            this.state_dict[`layer${i}.attn_wk`] = matrix(this.n_embd, this.n_embd)
-            this.state_dict[`layer${i}.attn_wv`] = matrix(this.n_embd, this.n_embd)
-            this.state_dict[`layer${i}.attn_wo`] = matrix(this.n_embd, this.n_embd)
-            this.state_dict[`layer${i}.mlp_fc1`] = matrix(4 * this.n_embd, this.n_embd)
-            this.state_dict[`layer${i}.mlp_fc2`] = matrix(this.n_embd, 4 * this.n_embd)
+    tokenize = (doc: string): number[] => [this.bos, ...doc.split("").map((c) => this.stoi[c]), this.bos];
+
+    /** Returns a cached causal mask for the given sequence length. Kept alive across tidy scopes. */
+    private getMask(T: number): tf.Tensor2D {
+        let m = this.maskCache.get(T);
+        if (!m) {
+            m = tf.keep(causalMask(T));
+            this.maskCache.set(T, m);
         }
-
-        this.m_buf = new Float64Array(this.params.length)
-        this.v_buf = new Float64Array(this.params.length)
+        return m;
     }
 
-    forward(token_id: number, pos_id: number, keys: Value[][][], values: Value[][][]) {
-        const tok_emb = this.state_dict['wte'][token_id]
-        const pos_emb = this.state_dict['wpe'][pos_id]
-        let x = zip(tok_emb, pos_emb).map(([t, p]) => t.add(p))
-        x = rmsnorm(x)
+    // ── Forward (training) ─────────────────────────────────────────────
 
-        for (let li = 0; li < this.n_layer; li++) {
-            let x_residual = x
-            x = rmsnorm(x)
-            const q = linear(x, this.state_dict[`layer${li}.attn_wq`])
-            const k = linear(x, this.state_dict[`layer${li}.attn_wk`])
-            const v = linear(x, this.state_dict[`layer${li}.attn_wv`])
-            keys[li].push(k)
-            values[li].push(v)
+    forward(idx: tf.Tensor2D): tf.Tensor3D {
+        const [B, T] = idx.shape;
+        const pos = this.posIdx.slice([0], [T]);
 
-            const x_attn: Value[] = []
-            for (let h = 0; h < this.n_head; h++) {
-                const hs = h * this.head_dim
-                const q_h = q.slice(hs, hs + this.head_dim)
-                const k_h = keys[li].map(ki => ki.slice(hs, hs + this.head_dim))
-                const v_h = values[li].map(vi => vi.slice(hs, hs + this.head_dim))
-                const attn_logits = k_h.map(kt => sum(zip(q_h, kt).map(([qi, ki]) => qi.mul(ki))).mul(this.scale))
-                const attn_weights = softmax(attn_logits)
-                for (let j = 0; j < this.head_dim; j++)
-                    x_attn.push(sum(attn_weights.map((aw, t) => aw.mul(v_h[t][j]))))
+        let x = tf.add(tf.gather(this.wte, idx), tf.gather(this.wpe, pos)) as tf.Tensor3D;
+        x = rmsnorm(x) as tf.Tensor3D;
+
+        const mask = this.getMask(T);
+
+        for (const L of this.layers)
+            x = this.transformerBlock(x, L, B, T, mask);
+
+        x = rmsnorm(x) as tf.Tensor3D;
+        return linear(x, this.lm_head);
+    }
+
+    /** Single transformer block: pre-norm attention + pre-norm FFN, both with residuals. */
+    private transformerBlock(x: tf.Tensor3D, L: LayerWeights, B: number, T: number, mask: tf.Tensor2D): tf.Tensor3D {
+        // ── self-attention ──
+        const normed1 = rmsnorm(x) as tf.Tensor3D;
+        const attnOut = this.multiheadAttention(normed1, L, B, T, mask);
+        const proj = linear(attnOut, L.attn_wo);
+        x = tf.add(x, proj) as tf.Tensor3D;
+
+        // ── feed-forward ──
+        const normed2 = rmsnorm(x) as tf.Tensor3D;
+        const hidden = tf.relu(linear(normed2, L.mlp_fc1));
+        const ffnOut = linear(hidden as tf.Tensor3D, L.mlp_fc2);
+        return tf.add(x, ffnOut) as tf.Tensor3D;
+    }
+
+    /** Multi-head scaled dot-product attention. Returns [B, T, n_embd] (pre-projection). */
+    private multiheadAttention(x: tf.Tensor3D, L: LayerWeights, B: number, T: number, mask: tf.Tensor2D): tf.Tensor3D {
+        const { n_head, head_dim, scale } = this;
+
+        const toHeads = (t: tf.Tensor3D) =>
+            tf.transpose(t.reshape([B, T, n_head, head_dim]), [0, 2, 1, 3]);
+        // each: [B, n_head, T, head_dim]
+
+        const qh = toHeads(linear(x, L.attn_wq));
+        const kh = toHeads(linear(x, L.attn_wk));
+        const vh = toHeads(linear(x, L.attn_wv));
+
+        // [B, n_head, T, T]
+        let scores = tf.mul(tf.matMul(qh, kh, false, true), scale);
+        scores = tf.add(scores, mask); // broadcast [T,T] over [B,H,T,T]
+        const weights = tf.softmax(scores);
+
+        // [B, n_head, T, head_dim] → [B, T, n_embd]
+        const attended = tf.matMul(weights, vh);
+        const merged = tf.transpose(attended, [0, 2, 1, 3]);
+        return merged.reshape([B, T, this.n_embd]) as tf.Tensor3D;
+    }
+
+    // ── Forward with trace (generation / visualization) ────────────────
+
+    forwardTrace(token_id: number, pos_id: number, ctx: number[]): Trace {
+        return tf.tidy(() => {
+            const tokens = [...ctx, token_id];
+            const T = tokens.length;
+            const inp = tf.tensor2d([tokens], [1, T], "int32");
+            const pos = this.posIdx.slice([0], [T]);
+
+            // helpers: extract the last-position vector or full matrix for the trace
+            const vec = (t: tf.Tensor): number[] =>
+                t.slice([0, T - 1, 0], [1, 1, -1]).squeeze().arraySync() as number[];
+            const mat = (t: tf.Tensor): number[][] =>
+                t.squeeze([0]).arraySync() as number[][];
+
+            // embed
+            let x = tf.add(tf.gather(this.wte, inp), tf.gather(this.wpe, pos)) as tf.Tensor3D;
+            const embedding = vec(x);
+
+            x = rmsnorm(x) as tf.Tensor3D;
+            const norm0 = vec(x);
+
+            const mask = this.getMask(T);
+            const layerTraces: LayerTrace[] = [];
+
+            for (const L of this.layers) {
+                const resid1 = x;
+                const r1 = vec(x);
+
+                x = rmsnorm(x) as tf.Tensor3D;
+                const norm1 = vec(x);
+
+                const q = linear(x, L.attn_wq), k = linear(x, L.attn_wk), v = linear(x, L.attn_wv);
+
+                const cached_keys = mat(k), cached_values = mat(v);
+
+                const { n_head, head_dim, scale } = this;
+                const toHeads = (t: tf.Tensor3D) => tf.transpose(t.reshape([1, T, n_head, head_dim]), [0, 2, 1, 3]);
+
+                const qh = toHeads(q), kh = toHeads(k), vh = toHeads(v);
+
+                let scores = tf.mul(tf.matMul(qh, kh, false, true), scale);
+                scores = tf.add(scores, mask);
+                const weights = tf.softmax(scores);
+
+                const attended = tf.matMul(weights, vh);
+
+                const scoresArr = scores.arraySync() as number[][][][];
+                const weightsArr = weights.arraySync() as number[][][][];
+                const attendedArr = attended.arraySync() as number[][][][];
+
+                const heads: HeadTrace[] = [];
+                for (let h = 0; h < n_head; h++)
+                    heads.push({ scores: scoresArr[0][h][T - 1], weights: weightsArr[0][h][T - 1], out: attendedArr[0][h][T - 1] });
+
+                const merged = tf.transpose(attended, [0, 2, 1, 3]).reshape([1, T, this.n_embd]) as tf.Tensor3D;
+                const concat = vec(merged);
+
+                const proj = linear(merged, L.attn_wo);
+                const wo = vec(proj);
+
+                x = tf.add(resid1, proj) as tf.Tensor3D;
+                const res1 = vec(x);
+
+                const resid2 = x;
+                const r2 = vec(x);
+
+                x = rmsnorm(x) as tf.Tensor3D;
+                const norm2 = vec(x);
+
+                const preRelu = linear(x, L.mlp_fc1);
+                const fc1 = vec(preRelu);
+
+                const postRelu = tf.relu(preRelu);
+                const relu = vec(postRelu);
+
+                const ffnOut = linear(postRelu as tf.Tensor3D, L.mlp_fc2);
+                const fc2 = vec(ffnOut);
+
+                x = tf.add(resid2, ffnOut) as tf.Tensor3D;
+                const res2 = vec(x);
+
+                layerTraces.push({
+                    r1, norm1,
+                    q: vec(q), k: vec(k), v: vec(v),
+                    cached_keys, cached_values,
+                    heads, concat, wo, res1,
+                    r2, norm2, fc1, relu, fc2, res2,
+                });
             }
 
-            x = linear(x_attn, this.state_dict[`layer${li}.attn_wo`])
-            x = x.map((a, i) => a.add(x_residual[i]))
+            x = rmsnorm(x) as tf.Tensor3D;
+            const logits = linear(x, this.lm_head);
 
-            x_residual = x
-            x = rmsnorm(x)
-            x = linear(x, this.state_dict[`layer${li}.mlp_fc1`])
-            x = x.map(xi => xi.relu())
-            x = linear(x, this.state_dict[`layer${li}.mlp_fc2`])
-            x = x.map((a, i) => a.add(x_residual[i]))
-        }
-
-        const logits = linear(x, this.state_dict['lm_head'])
-        return logits
+            return { token_id, pos_id, embedding, norm0, layers: layerTraces, logits: vec(logits), probs: vec(tf.softmax(logits)) } satisfies Trace;
+        }) as Trace;
     }
 
-    newKV = () => Array.from({ length: this.n_layer }, () => [])
+    // ── Training ───────────────────────────────────────────────────────
 
-    trainStep(tokens: number[], lr = 0.01) {
-        this.step_count++
-        const beta1 = 0.85, beta2 = 0.99, eps = 1e-8
-        for (const p of this.params) p.grad = 0
+    /** Run a single optimizer step. Returns the loss tensor (not awaited — no GPU sync). */
+    private trainStep(batchSize: number): number {
+        const { block_size, tokenizedDocs, vocab_size } = this;
 
-        const n = Math.min(this.block_size, tokens.length - 1)
-        const keys = this.newKV()
-        const values = this.newKV()
-        const losses: Value[] = []
+        // pick random pre-tokenized docs
+        const batchTokens = Array.from({ length: batchSize }, () =>
+            tokenizedDocs[Math.floor(Math.random() * tokenizedDocs.length)])
 
-        for (let pos = 0; pos < n; pos++) {
-            const logits = this.forward(tokens[pos], pos, keys, values)
-            const probs = softmax(logits)
-            losses.push(probs[tokens[pos + 1]].log().neg())
+        const lengths = batchTokens.map((t) => Math.min(block_size + 1, t.length));
+        const T = Math.max(...lengths) - 1;
+
+        const inputBuf: number[] = [], targetBuf: number[] = [], weightBuf: number[] = [];
+
+        for (let i = 0; i < batchSize; i++) {
+            const toks = batchTokens[i];
+            const len = lengths[i];
+            const padLen = T - (len - 1);
+            for (let j = 0; j < len - 1; j++) inputBuf.push(toks[j]);
+            for (let j = 0; j < padLen; j++) inputBuf.push(0);
+            for (let j = 1; j < len; j++) targetBuf.push(toks[j]);
+            for (let j = 0; j < padLen; j++) targetBuf.push(0);
+            for (let j = 0; j < len - 1; j++) weightBuf.push(1);
+            for (let j = 0; j < padLen; j++) weightBuf.push(0);
         }
 
-        const loss = sum(losses).mul(1 / n)
-        loss.backward()
+        this.step_count++;
 
-        const lr_t = Math.max(lr / 1000, lr * (1 - this.step_count / 1000))
-        const bc1 = 1 - beta1 ** this.step_count
-        const bc2 = 1 - beta2 ** this.step_count
-        for (let i = 0; i < this.params.length; i++) {
-            const p = this.params[i]
-            this.m_buf[i] = beta1 * this.m_buf[i] + (1 - beta1) * p.grad
-            this.v_buf[i] = beta2 * this.v_buf[i] + (1 - beta2) * p.grad ** 2
-            p.data -= lr_t * (this.m_buf[i] / bc1) / (Math.sqrt(this.v_buf[i] / bc2) + eps)
-            p.grad = 0
-        }
-        return loss.data
+        const loss = tf.tidy(() => {
+            const inputs = tf.tensor2d(inputBuf, [batchSize, T], "int32");
+            const targets = tf.tensor1d(targetBuf, "int32");
+            const weights = tf.tensor1d(weightBuf, "float32");
+
+            return this.optimizer.minimize(() => {
+                const logits = this.forward(inputs);
+                const logitsFlat = logits.reshape([batchSize * T, vocab_size]);
+                const oneHot = tf.oneHot(targets, vocab_size);
+                return tf.losses.softmaxCrossEntropy(oneHot, logitsFlat, weights);
+            }, true) as tf.Scalar;
+        });
+        return loss.dataSync()[0]
     }
 
-    generate(temperature = 0.5): string {
-        const keys = this.newKV(), values = this.newKV()
-        let token_id = this.bos
-        const sample = []
-
-        for (let pos = 0; pos < this.block_size; pos++) {
-            const logits = this.forward(token_id, pos, keys, values)
-            const probs = softmax(logits.map(l => l.div(temperature)))
-            const r = Math.random()
-            let cum = 0
-            token_id = probs.length - 1
-            for (let i = 0; i < probs.length; i++) {
-                cum += probs[i].data
-                if (r < cum) { token_id = i; break }
-            }
-            if (token_id === this.bos) break
-            sample.push(this.uchars[token_id])
-        }
-
-        return sample.join('')
-    }
-
-    forwardTrace(token_id: number, pos_id: number, keys: Value[][][], values: Value[][][]): Trace {
-        const d = (v: Value[]) => v.map(x => x.data)
-        const tok_emb = this.state_dict['wte'][token_id]
-        const pos_emb = this.state_dict['wpe'][pos_id]
-        let x = zip(tok_emb, pos_emb).map(([t, p]) => t.add(p))
-        const embedding = d(x)
-        x = rmsnorm(x)
-        const norm0 = d(x)
-
-        const layerTraces: LayerTrace[] = []
-        for (let li = 0; li < this.n_layer; li++) {
-            let x_residual = x
-            const r1 = d(x)
-            x = rmsnorm(x)
-            const norm1 = d(x)
-            const q = linear(x, this.state_dict[`layer${li}.attn_wq`])
-            const k = linear(x, this.state_dict[`layer${li}.attn_wk`])
-            const v = linear(x, this.state_dict[`layer${li}.attn_wv`])
-            keys[li].push(k)
-            values[li].push(v)
-            const cached_keys = keys[li].map(ki => ki.map(x => x.data))
-            const cached_values = values[li].map(vi => vi.map(x => x.data))
-
-            const heads: HeadTrace[] = []
-            const x_attn: Value[] = []
-            for (let h = 0; h < this.n_head; h++) {
-                const hs = h * this.head_dim
-                const q_h = q.slice(hs, hs + this.head_dim)
-                const k_h = keys[li].map(ki => ki.slice(hs, hs + this.head_dim))
-                const v_h = values[li].map(vi => vi.slice(hs, hs + this.head_dim))
-                const attn_logits = k_h.map(kt => sum(zip(q_h, kt).map(([qi, ki]) => qi.mul(ki))).mul(this.scale))
-                const attn_weights = softmax(attn_logits)
-                const head_out: Value[] = []
-                for (let j = 0; j < this.head_dim; j++)
-                    head_out.push(sum(attn_weights.map((aw, t) => aw.mul(v_h[t][j]))))
-                x_attn.push(...head_out)
-                heads.push({ scores: d(attn_logits), weights: d(attn_weights), out: d(head_out) })
-            }
-
-            const concat = d(x_attn)
-            x = linear(x_attn, this.state_dict[`layer${li}.attn_wo`])
-            const wo = d(x)
-            x = x.map((a, i) => a.add(x_residual[i]))
-            const res1 = d(x)
-
-            x_residual = x
-            const r2 = d(x)
-            x = rmsnorm(x)
-            const norm2 = d(x)
-            x = linear(x, this.state_dict[`layer${li}.mlp_fc1`])
-            const fc1 = d(x)
-            x = x.map(xi => xi.relu())
-            const relu = d(x)
-            x = linear(x, this.state_dict[`layer${li}.mlp_fc2`])
-            const fc2 = d(x)
-            x = x.map((a, i) => a.add(x_residual[i]))
-            const res2 = d(x)
-
-            layerTraces.push({ r1, norm1, q: d(q), k: d(k), v: d(v), cached_keys, cached_values, heads, concat, wo, res1, r2, norm2, fc1, relu, fc2, res2 })
-        }
-
-        const logits = linear(x, this.state_dict['lm_head'])
-        const probs = softmax(logits)
-        return { token_id, pos_id, embedding, norm0, layers: layerTraces, logits: d(logits), probs: d(probs) }
-    }
+    trainSteps = (b = 8, length = 1) => Array.from({ length }, () => this.trainStep(b)).reduce((a, b) => a + b / length, 0)
 }
-
-export type HeadTrace = { scores: number[], weights: number[], out: number[] }
-export type LayerTrace = {
-    r1: number[], norm1: number[], q: number[], k: number[], v: number[],
-    cached_keys: number[][], cached_values: number[][],
-    heads: HeadTrace[], concat: number[], wo: number[], res1: number[],
-    r2: number[], norm2: number[], fc1: number[], relu: number[], fc2: number[], res2: number[]
-}
-export type Trace = {
-    token_id: number, pos_id: number, embedding: number[], norm0: number[],
-    layers: LayerTrace[], logits: number[], probs: number[]
-}
-
-export { softmax }
-

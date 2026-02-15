@@ -1,0 +1,25 @@
+Top 20 most time-consuming functions:
+┌─────────┬────────────────────────────────────────────────┬───────┬────────────┬──────────┐
+│ (index) │ name                                           │ count │ totalDurMs │ avgDurMs │
+├─────────┼────────────────────────────────────────────────┼───────┼────────────┼──────────┤
+│ 0       │ 'RunTask'                                      │ 38021 │ '15910.63' │ '0.42'   │
+│ 1       │ 'v8.callFunction'                              │ 361   │ '7845.69'  │ '21.73'  │
+│ 2       │ 'FunctionCall'                                 │ 361   │ '7841.74'  │ '21.72'  │
+│ 3       │ 'v8::Debugger::AsyncTaskRun'                   │ 60632 │ '7806.90'  │ '0.13'   │
+│ 4       │ 'GPUTask'                                      │ 6857  │ '7786.64'  │ '1.14'   │
+│ 5       │ 'TimerFire'                                    │ 61    │ '5735.72'  │ '94.03'  │
+│ 6       │ 'V8Console::runTask'                           │ 48195 │ '2021.15'  │ '0.04'   │
+│ 7       │ 'V8.StackGuard'                                │ 612   │ '166.17'   │ '0.27'   │
+│ 8       │ 'V8.HandleInterrupts'                          │ 609   │ '165.70'   │ '0.27'   │
+│ 9       │ 'V8.InvokeApiInterruptCallbacks'               │ 1     │ '132.35'   │ '132.35' │
+│ 10      │ 'CpuProfiler::StartProfiling'                  │ 1     │ '132.30'   │ '132.30' │
+│ 11      │ 'V8.GC_SCAVENGER_BACKGROUND_SCAVENGE_PARALLEL' │ 680   │ '82.43'    │ '0.12'   │
+│ 12      │ 'MinorGC'                                      │ 94    │ '47.94'    │ '0.51'   │
+│ 13      │ 'V8.GCScavenger'                               │ 94    │ '46.17'    │ '0.49'   │
+│ 14      │ 'V8.GC_SCAVENGER'                              │ 94    │ '45.48'    │ '0.48'   │
+│ 15      │ 'V8.GC_SCAVENGER_SCAVENGE'                     │ 94    │ '41.63'    │ '0.44'   │
+│ 16      │ 'V8.GC_MC_BACKGROUND_MARKING'                  │ 13    │ '32.57'    │ '2.51'   │
+│ 17      │ 'V8.GC_SCAVENGER_SCAVENGE_PARALLEL_PHASE'      │ 94    │ '20.17'    │ '0.21'   │
+│ 18      │ 'V8.GC_SCAVENGER_SCAVENGE_PARALLEL'            │ 185   │ '16.38'    │ '0.09'   │
+│ 19      │ 'v8::Debugger::AsyncTaskScheduled'             │ 14184 │ '14.88'    │ '0.00'   │
+└─────────┴────────────────────────────────────────────────┴───────┴────────────┴──────────┘

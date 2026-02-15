@@ -1,10 +1,8 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
 @import 'tailwindcss';
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
-
 body {
-    width: 900px;
-    max-width: 88vw;
+    width: 100vw;
     margin: 0 auto;
     font: 18px/1.6 'Inter', sans-serif;
     background: #111;

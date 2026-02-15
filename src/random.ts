@@ -1,6 +1,6 @@
-export const seed = () => {}
+export const seed = () => { }
 
-export const choices = (choices: any[], probs: number[]) => {
+export const choices = <T>(choices: T[], probs: number[]) => {
     let r = Math.random();
     for (let i = 0; i < probs.length; i++)
         if ((r -= probs[i]) < 0) return choices[i];
@@ -8,6 +8,6 @@ export const choices = (choices: any[], probs: number[]) => {
 }
 
 export const gauss = (mu: number, sigma: number) => {
-    let u = Math.random(), v = Math.random();
+    const u = Math.random(), v = Math.random();
     return mu + sigma * Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
