@@ -239,6 +239,85 @@ export class MicroGPT {
 
         return sample.join('')
     }
+
+    forwardTrace(token_id: number, pos_id: number, keys: Value[][][], values: Value[][][]): Trace {
+        const d = (v: Value[]) => v.map(x => x.data)
+        const tok_emb = this.state_dict['wte'][token_id]
+        const pos_emb = this.state_dict['wpe'][pos_id]
+        let x = zip(tok_emb, pos_emb).map(([t, p]) => t.add(p))
+        const embedding = d(x)
+        x = rmsnorm(x)
+        const norm0 = d(x)
+
+        const layerTraces: LayerTrace[] = []
+        for (let li = 0; li < this.n_layer; li++) {
+            let x_residual = x
+            const r1 = d(x)
+            x = rmsnorm(x)
+            const norm1 = d(x)
+            const q = linear(x, this.state_dict[`layer${li}.attn_wq`])
+            const k = linear(x, this.state_dict[`layer${li}.attn_wk`])
+            const v = linear(x, this.state_dict[`layer${li}.attn_wv`])
+            keys[li].push(k)
+            values[li].push(v)
+            const cached_keys = keys[li].map(ki => ki.map(x => x.data))
+            const cached_values = values[li].map(vi => vi.map(x => x.data))
+
+            const heads: HeadTrace[] = []
+            const x_attn: Value[] = []
+            for (let h = 0; h < this.n_head; h++) {
+                const hs = h * this.head_dim
+                const q_h = q.slice(hs, hs + this.head_dim)
+                const k_h = keys[li].map(ki => ki.slice(hs, hs + this.head_dim))
+                const v_h = values[li].map(vi => vi.slice(hs, hs + this.head_dim))
+                const attn_logits = k_h.map(kt => sum(zip(q_h, kt).map(([qi, ki]) => qi.mul(ki))).mul(this.scale))
+                const attn_weights = softmax(attn_logits)
+                const head_out: Value[] = []
+                for (let j = 0; j < this.head_dim; j++)
+                    head_out.push(sum(attn_weights.map((aw, t) => aw.mul(v_h[t][j]))))
+                x_attn.push(...head_out)
+                heads.push({ scores: d(attn_logits), weights: d(attn_weights), out: d(head_out) })
+            }
+
+            const concat = d(x_attn)
+            x = linear(x_attn, this.state_dict[`layer${li}.attn_wo`])
+            const wo = d(x)
+            x = x.map((a, i) => a.add(x_residual[i]))
+            const res1 = d(x)
+
+            x_residual = x
+            const r2 = d(x)
+            x = rmsnorm(x)
+            const norm2 = d(x)
+            x = linear(x, this.state_dict[`layer${li}.mlp_fc1`])
+            const fc1 = d(x)
+            x = x.map(xi => xi.relu())
+            const relu = d(x)
+            x = linear(x, this.state_dict[`layer${li}.mlp_fc2`])
+            const fc2 = d(x)
+            x = x.map((a, i) => a.add(x_residual[i]))
+            const res2 = d(x)
+
+            layerTraces.push({ r1, norm1, q: d(q), k: d(k), v: d(v), cached_keys, cached_values, heads, concat, wo, res1, r2, norm2, fc1, relu, fc2, res2 })
+        }
+
+        const logits = linear(x, this.state_dict['lm_head'])
+        const probs = softmax(logits)
+        return { token_id, pos_id, embedding, norm0, layers: layerTraces, logits: d(logits), probs: d(probs) }
+    }
+}
+
+export type HeadTrace = { scores: number[], weights: number[], out: number[] }
+export type LayerTrace = {
+    r1: number[], norm1: number[], q: number[], k: number[], v: number[],
+    cached_keys: number[][], cached_values: number[][],
+    heads: HeadTrace[], concat: number[], wo: number[], res1: number[],
+    r2: number[], norm2: number[], fc1: number[], relu: number[], fc2: number[], res2: number[]
+}
+export type Trace = {
+    token_id: number, pos_id: number, embedding: number[], norm0: number[],
+    layers: LayerTrace[], logits: number[], probs: number[]
 }
 
 export { softmax }
+

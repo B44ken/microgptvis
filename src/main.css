@@ -3,16 +3,22 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
 
 body {
-    width: 700px;
+    width: 900px;
     max-width: 88vw;
-    margin: 20px auto;
+    margin: 0 auto;
     font: 18px/1.6 'Inter', sans-serif;
     background: #111;
     color: #eee;
 }
 
-a { color: inherit; }
-details { margin: 4px 0; }
+a {
+    color: inherit;
+    text-decoration: underline;
+}
+
+details {
+    margin: 4px 0;
+}
 
 pre {
     background: #0d1117;
@@ -28,5 +34,8 @@ code {
 }
 
 @media(orientation: portrait) {
-    body { width: 100vw; font-size: 16px; }
+    body {
+        width: 100vw;
+        font-size: 16px;
+    }
 }
