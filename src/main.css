@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+
+body {
+    width: 700px;
+    max-width: 88vw;
+    margin: 20px auto;
+    font: 18px/1.6 'Inter', sans-serif;
+    background: #111;
+    color: #eee;
+}
+
+a { color: inherit; }
+details { margin: 4px 0; }
+
+pre {
+    background: #0d1117;
+    padding: 1em;
+    border-radius: 4px;
+    overflow-x: auto;
+}
+
+code {
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 0 2px;
+}
+
+@media(orientation: portrait) {
+    body { width: 100vw; font-size: 16px; }
+}
