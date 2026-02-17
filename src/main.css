@@ -22,7 +22,7 @@ details {
 }
 
 nav {
-    @apply fixed inset-y-0 left-0 z-40 w-[90vw] bg-[#111] p-6 shadow-2xl transition-transform duration-300 transform max-md:-translate-x-full md:translate-x-0 md:relative md:shadow-none md:p-0 md:py-12 md:flex md:flex-col overflow-y-auto md:w-[360px] border-r md:border-none border-zinc-800;
+    @apply fixed inset-y-0 left-0 z-40 w-[90vw] bg-[#111] p-6 shadow-2xl transition-transform duration-300 transform max-md:-translate-x-full md:translate-x-0 md:relative md:shadow-none md:p-0 md:py-12 md:flex md:flex-col overflow-y-auto md:max-h-screen md:w-[360px] border-r md:border-none border-zinc-800;
 
     &>* {
         @apply mt-3

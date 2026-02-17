@@ -32,8 +32,8 @@ export default function App() {
   }
 
   const train = useCallback(() => {
-    const m = model.current; if (!m) return
-    setRun(r => ({ ...r, loss: m.trainSteps(10, opts.batch), step: m.step_count }))
+    const m = model.current
+    m && setRun(r => ({ ...r, loss: m.trainSteps(10, opts.batch), step: m.step_count }))
   }, [opts.batch])
 
   const gen = useCallback(() => {
@@ -108,6 +108,5 @@ export default function App() {
     </nav >
 
     <main> <Architecture trace={run.trace} onClickNode={i => { setExplain(i); setSidebar(true) }} cfg={opts as Required<ModelOpts>} collapsed={collapsed} /> </main>
-
   </>
 }
